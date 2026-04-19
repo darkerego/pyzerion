@@ -8,14 +8,15 @@ import argparse
 import asyncio
 import base64
 import json
+import os
 from os import environ
 from pprint import pprint
-from typing import Any, Dict, List, Optional, Coroutine
+from typing import Any, Dict, List, Optional
 
 import httpx
-import web3
 from dotenv import load_dotenv
 from eth_typing import ChecksumAddress
+from eth_utils import to_checksum_address
 
 
 class EnvironmentNotConfigured(Exception):
@@ -174,9 +175,36 @@ class ZerionApi:
                "[trash]=only_non_trash&sort=value&sync=false" % address.__str__()
         return await self._get(url=url)
 
+
+    """
+    @:param address: a 0x style Ethereum address
+    @:return list[dict[str, Any]]
+    """
+
     async def wallet(self, address: ChecksumAddress | str) -> list[dict[str, Any]]:
         results = await self._wallet(address)
         return await self.parse_wallet_positions(results)
+
+    """
+    @:param address_list_file: text file with list of addresses line by line
+    @:param raw: print as raw json for `jq` compatibility
+    @:delay: time delay between requests (adjust dependant on your API key's rate limit)
+    @:return None (prints to stdout)
+    """
+    async def file(self, address_list_file: str, raw: bool = False, delay: float = 1.0) -> None:
+        if not os.path.isfile(address_list_file):
+            raise FileNotFoundError(f"File {address_list_file} not found")
+        with open(address_list_file, "r") as f:
+            addresses = f.readlines()
+            for addr in addresses:
+                result = {'account': addr.strip(), 'assets': await self.wallet(to_checksum_address(addr.strip()))}
+                if raw:
+                    print(json.dumps(result))
+                else:
+                    pprint(result)
+            await asyncio.sleep(delay)
+        return None
+
 
 """
 Command line tool entry point
@@ -187,10 +215,13 @@ def main():
     parser.add_argument('-r', '--raw', action='store_true', help='Do not pretty print, '
                                                                  'for piping to jq')
     subparsers = parser.add_subparsers(dest='command')
-    subparsers.add_parser('gas')
-    subparsers.add_parser('chains')
-    wallet = subparsers.add_parser('wallet')
-    wallet.add_argument('address', type=str)
+    subparsers.add_parser('gas', help='Get gas prices and information for all supported chains')
+    subparsers.add_parser('chains', help='Get all supported chains')
+    wallet = subparsers.add_parser('wallet', help='Scan a single ethereum wallet for balance data')
+    wallet.add_argument('address', type=str, help="Ethereum address")
+    file = subparsers.add_parser('file', help='Scan multiple addresses from file')
+    file.add_argument('path', type=str, help='Path to list of addresses')
+    file.add_argument('--delay', type=float, default=1.0, help='Delay between requests')
     args = parser.parse_args()
     load_dotenv()
     api_key = environ.get('ZERION_API_KEY', False)
@@ -198,7 +229,9 @@ def main():
         raise EnvironmentNotConfigured("dotenv variable `ZERION_API_KEY` is not set!")
     api = ZerionApi(api_key)
     if args.command == 'wallet':
-        coro = api.wallet(web3.Web3.to_checksum_address(args.address))
+        coro = api.wallet(to_checksum_address(args.address))
+    elif args.command == 'file':
+        coro = api.file(args.path, args.raw, args.delay)
     else:
         fn = getattr(api, args.command)
         coro = fn()
@@ -208,9 +241,11 @@ def main():
         loop = asyncio.new_event_loop()
     ret = loop.run_until_complete(coro)
     if args.raw:
-        print(json.dumps(ret))
+        if ret:
+            print(json.dumps(ret))
     else:
-        pprint(ret)
+        if ret:
+            pprint(ret)
 
 if __name__ == "__main__":
     main()
