@@ -9,17 +9,28 @@ import asyncio
 import base64
 import json
 import os
+import time
+from asyncio import AbstractEventLoop
+from binascii import Error
 from os import environ
 from pprint import pprint
 from typing import Any, Dict, List, Optional
+from signal import SIGINT, SIGTERM
+
 
 import httpx
 from dotenv import load_dotenv
 from eth_typing import ChecksumAddress
 from eth_utils import to_checksum_address
-
+from web3 import Account
+from_key = Account.from_key
 
 class EnvironmentNotConfigured(Exception):
+    pass
+
+try:
+    os.mkdir('results')
+except FileExistsError:
     pass
 
 """
@@ -27,14 +38,36 @@ class EnvironmentNotConfigured(Exception):
 * Notice: this is an alpha release W.I.P.
 """
 
+
+"""
+Attempts to parse line as a private key and derive address. 
+Failing that, attempt to parse as an address directly
+@:param line: string EVM key or address
+@:return resulting ChecksumAddress
+"""
+def parse_line(line: str) -> ChecksumAddress | None:
+    try:
+        return from_key(line).address  # ignore erroneous "combomethod not callable IDE warning"
+    except (ValueError, Error):
+        try:
+            return to_checksum_address(line)
+        except (ValueError, Error):
+            return None
+
+
+
 class ZerionApi:
-    def __init__(self, _api_key: str = None):
+    def __init__(self, _api_key: str = None, loop: AbstractEventLoop = None):
         load_dotenv()
+        self.loop = loop or asyncio.get_event_loop()
+        self.tasks = set()
         self.api_key = _api_key if _api_key else environ.get('ZERION_API_KEY')
         self.encoded_api_key = base64.b64encode(self.api_key.encode()+b':').decode()
         self.headers = {'Authorization': 'Basic %s' % self.encoded_api_key,"accept": "application/json"}
         self.session = httpx.AsyncClient()
         self.chain_list: list[str] = []
+        self.results = {}
+        self.results_output = f'results/{time.time()}.json'
 
     """
     Checks if __a_init__ has ran yet by checking if the program has retrieved 
@@ -88,7 +121,11 @@ class ZerionApi:
 
     @staticmethod
     async def parse_wallet_positions(portfolio_json: Dict[str, Any]) -> List[Dict[str, Any]]:
+        def format_float(n: float, digits: int = 4) -> str:
+            return "{:.{d}f}".format(n, d=digits)
         results: List[Dict[str, Any]] = []
+        day_change_human = None
+        day_change = None
         data = portfolio_json.get("data", [])
 
         for position in data:
@@ -103,11 +140,13 @@ class ZerionApi:
             amount = quantity.get("float")
             decimals = quantity.get("decimals", 0)
             price = attributes.get("price")
-            day_change = attributes.get('changes').get("percent_1d")
-            if float(day_change) > 0:
-                day_change_human = str("+" + str(round(float(day_change), 4)) + "%")
-            else:
-                day_change_human = str(round(float(day_change), 4)) + "%"
+            changes = attributes.get("changes", None)
+            if changes:
+                day_change = changes.get("percent_1d")
+                if float(day_change) > 0:
+                    day_change_human = str("+" + str(round(float(day_change), 4)) + "%")
+                else:
+                    day_change_human = str(round(float(day_change), 4)) + "%"
 
             fungible_info = attributes.get("fungible_info", {})
             asset_name = fungible_info.get("name")
@@ -135,9 +174,9 @@ class ZerionApi:
                 "chain": chain_id,
                 "decimals": decimals,
                 "contract_address": contract_address,
-                "amount": amount,
-                "value_usd": value_usd,
-                "price": price,
+                "amount": format_float(amount, 12),
+                "value_usd": format_float(value_usd),
+                "price": format_float(price, 8),
                 "1d_change_str": day_change_human,
                 "1d_change_flt": day_change,
             }
@@ -197,13 +236,34 @@ class ZerionApi:
         with open(address_list_file, "r") as f:
             addresses = f.readlines()
             for addr in addresses:
-                result = {'account': addr.strip(), 'assets': await self.wallet(to_checksum_address(addr.strip()))}
+                acct = parse_line(addr.strip())
+                res = await self.wallet(acct)
+                result = {'account': acct, 'assets': res}
+                self.results.update({acct: res})
+                t = self.loop.create_task(self.write(), name='write')
+                t.add_done_callback(self.tasks.discard)
+                self.tasks.add(t)
                 if raw:
                     print(json.dumps(result))
                 else:
                     pprint(result)
-            await asyncio.sleep(delay)
+                await asyncio.sleep(delay)
         return None
+
+    """
+    JSON Dumps results to disc
+    @:return None 
+    """
+    async def write(self):
+        """
+        Blocking IO sync function runs in executor
+        """
+        def write_blocking():
+            with open(self.results_output, 'w') as ff:
+                ff.write(json.dumps(self.results))
+        await self.loop.run_in_executor(None, write_blocking)
+
+
 
 
 """
@@ -227,26 +287,39 @@ def main():
     api_key = environ.get('ZERION_API_KEY', False)
     if not isinstance(api_key, str):
         raise EnvironmentNotConfigured("dotenv variable `ZERION_API_KEY` is not set!")
-    api = ZerionApi(api_key)
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+    api = ZerionApi(api_key, loop)
     if args.command == 'wallet':
-        coro = api.wallet(to_checksum_address(args.address))
+        coro = api.wallet(parse_line(args.address))
     elif args.command == 'file':
         coro = api.file(args.path, args.raw, args.delay)
     else:
         fn = getattr(api, args.command)
         coro = fn()
     try:
-        loop = asyncio.get_running_loop()
-    except RuntimeError:
-        loop = asyncio.new_event_loop()
-    ret = loop.run_until_complete(coro)
-    if args.raw:
-        if ret:
-            print(json.dumps(ret))
+        ret = loop.run_until_complete(coro)
+    except KeyboardInterrupt:
+        try:
+            for task in asyncio.all_tasks():
+                task.cancel()
+        except RuntimeError:
+            pass
+
+        loop.close()
     else:
-        if ret:
-            pprint(ret)
+
+        if args.raw:
+            if ret:
+                print(json.dumps(ret))
+        else:
+            if ret:
+                pprint(ret)
 
 if __name__ == "__main__":
     main()
+
+
 
